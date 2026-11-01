@@ -1,399 +1,410 @@
-import os, yaml, pathlib, json, uuid
-from urllib.parse import urljoin
+"""Domain Redmine MCP server — 4 read-only tools for requirements + completion."""
+from __future__ import annotations
 
-import httpx
-from mcp.server.mcpserver import MCPServer, Image, Context
+import json
+import uuid
+from typing import Any
+
+from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.utilities.logging import get_logger
 
-### Constants ###
-
-VERSION = "2026.10.15.204909"
-
-# Load OpenAPI spec
-current_dir = pathlib.Path(__file__).parent
-with open(current_dir / 'redmine_openapi.yml') as f:
-    SPEC = yaml.safe_load(f)
-
-# Constants from environment
-REDMINE_URL = os.environ['REDMINE_URL'].rstrip('/') + '/'  # Normalize to always end with /
-REDMINE_API_KEY = os.environ.get('REDMINE_API_KEY', '')  # optional: HTTP clients can send X-Redmine-API-Key per request
-REDMINE_RESPONSE_FORMAT = os.environ.get('REDMINE_RESPONSE_FORMAT', 'yaml').lower()
-
-# Custom headers (format: "Header1: Value1, Header2: Value2")
-REDMINE_HEADERS = {}
-if custom_headers := os.environ.get('REDMINE_HEADERS', ''):
-    for header in custom_headers.split(','):
-        if ':' in header:
-            key, value = header.split(':', 1)
-            REDMINE_HEADERS[key.strip()] = value.strip()
-
-# Allowed directories for upload/download (secure by default - disabled if not set)
-REDMINE_ALLOWED_DIRECTORIES = [
-    pathlib.Path(d.strip()).resolve()
-    for d in os.environ.get('REDMINE_ALLOWED_DIRECTORIES', '').split(',')
-    if d.strip()
-]
-
-# SSL verification (disabled only when explicitly set to "1")
-REDMINE_DANGEROUSLY_ACCEPT_INVALID_CERTS = os.environ.get('REDMINE_DANGEROUSLY_ACCEPT_INVALID_CERTS') == '1'
-
-# Custom CA bundle for private certificate chains (path to a ca.crt / bundle file)
-REDMINE_CA_BUNDLE = os.environ.get('REDMINE_CA_BUNDLE', '')
-
-# Read-only mode (enabled when set to "1") - only GET requests are allowed
-REDMINE_READ_ONLY = os.environ.get('REDMINE_READ_ONLY') == '1'
-
-if REDMINE_DANGEROUSLY_ACCEPT_INVALID_CERTS:
-    _ssl_verify = False
-elif REDMINE_CA_BUNDLE:
-    _ssl_verify = REDMINE_CA_BUNDLE
-else:
-    _ssl_verify = True
-
-# Persistent HTTP client — reuses TCP/TLS connections across calls instead of opening a new one each time.
-# Using httpx.request() (top-level function) creates a new connection per call, which adds ~2 minutes of
-# TLS handshake overhead on each request when connecting to internal/corporate Redmine servers.
-# keepalive_expiry=120 keeps connections alive for 2 minutes; the httpx default of 5s means every call
-# after a short pause pays a full ~600ms TLS reconnect cost.
-_http_client = httpx.Client(
-    timeout=60.0,
-    verify=_ssl_verify,
-    limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=120),
+from mcp_redmine.client import RedmineClient, scrub_key
+from mcp_redmine.completion.evidence import build_evidence, build_requirements
+from mcp_redmine.config import Settings, load_dotenv
+from mcp_redmine.errors import ToolError
+from mcp_redmine.mappers import (
+    approx_tokens,
+    decode_cursor,
+    encode_cursor,
+    map_child,
+    map_journals,
+    utc_now_iso,
 )
+from mcp_redmine.models.common import Meta
+from mcp_redmine.models.issue import TimelineResult
+from mcp_redmine.openapi_spec import list_paths, path_info
 
-if "REDMINE_REQUEST_INSTRUCTIONS" in os.environ:
-    with open(os.environ["REDMINE_REQUEST_INSTRUCTIONS"]) as f:
-        REDMINE_REQUEST_INSTRUCTIONS = f.read()
-else:
-    REDMINE_REQUEST_INSTRUCTIONS = ""
+VERSION = "2026.10.31"
 
+mcp = MCPServer(
+    "Redmine task MCP",
+    version=VERSION,
+    instructions=(
+        "Read-only Redmine access. Prefer helpers when they fit: "
+        "get_completion_evidence (done / ready to close?), "
+        "get_task_requirements (read/analyze requirements or AC), "
+        "list_child_tasks (breakdown), get_task_timeline (history). "
+        "For any other Redmine read use redmine_get(path, params); call "
+        "redmine_paths_list / redmine_paths_info first if the endpoint is unknown. "
+        "Never use curl or external HTTP for Redmine."
+    ),
+)
+logger = get_logger(__name__)
 
-# Core
-def request(path: str, method: str = 'get', data: dict = None, params: dict = None,
-            content_type: str = 'application/json', content: bytes = None, raw: bool = False,
-            ctx: Context = None) -> dict:
-    if REDMINE_READ_ONLY and method.lower() != 'get':
-        return {"status_code": 0, "body": None,
-                "error": f"REDMINE_READ_ONLY is enabled: refusing {method.upper()} request"}
-
-    # On HTTP transports a client can send its own key per request, so a shared server acts
-    # as the calling user instead of one service account (#49). Env key is the fallback.
-    headers = {} if ctx is None or ctx.headers is None else ctx.headers  # no headers on stdio
-    key = headers.get('x-redmine-api-key') or REDMINE_API_KEY
-    if not key:
-        return {"status_code": 0, "body": None,
-                "error": "No API key: set REDMINE_API_KEY or send an X-Redmine-API-Key request header"}
-
-    headers = {
-        'X-Redmine-API-Key': key,
-        'Content-Type': content_type,
-        **REDMINE_HEADERS
-    }
-
-    # Security: path is model-controlled. urljoin returns absolute URLs in `path` unchanged, which would
-    # redirect the request (and the API key header) to an arbitrary host. Only ever allow URLs that stay
-    # under REDMINE_URL (which is normalized to end with '/'), also catching '../' path traversal.
-    url = urljoin(REDMINE_URL, path.lstrip('/'))
-    if not url.startswith(REDMINE_URL):
-        return {"status_code": 0, "body": None,
-                "error": f"Path escapes REDMINE_URL, refusing to send API key to: {url}"}
-
-    try:
-        response = _http_client.request(method=method.lower(), url=url, json=data, params=params, headers=headers,
-                                       content=content)
-        response.raise_for_status()
-
-        body = None
-        if raw:
-            # Downloads must keep the exact bytes: an attachment that happens to be valid JSON
-            # (e.g. a Postman collection) must not be parsed into a dict (#46).
-            body = response.content
-        elif response.content:
-            try:
-                body = response.json()
-            except ValueError:
-                body = response.content
-
-        return {"status_code": response.status_code, "body": body, "error": ""}
-    except Exception as e:
-        try:
-            status_code = e.response.status_code
-        except:
-            status_code = 0
-
-        try:
-            body = e.response.json()
-        except:
-            try:
-                body = e.response.text
-            except:
-                body = None
-
-        return {"status_code": status_code, "body": body, "error": f"{e.__class__.__name__}: {e}"}
-        
-def redact(obj):
-    """Redact credential values from parsed API responses. Redmine returns the requesting
-    user's api_key on several /users endpoints, and tool results end up in model context,
-    transcripts and logs (reported in #50, thanks @nick411077)."""
-    if isinstance(obj, dict):
-        return {k: ("[REDACTED]" if k.lower().replace("-", "_") in ("api_key", "apikey") else redact(v))
-                for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [redact(x) for x in obj]
-    return obj
+_settings: Settings | None = None
+_client: RedmineClient | None = None
 
 
-def scrub_key(text: str) -> str:
-    """Remove the configured API key from any outgoing text, wherever it appears."""
-    if REDMINE_API_KEY and isinstance(text, str):
-        return text.replace(REDMINE_API_KEY, "[REDACTED]")
-    return text
+def configure(settings: Settings | None = None) -> Settings:
+    """Load settings and (re)create HTTP client. Safe to call from tests."""
+    global _settings, _client
+    if _client is not None:
+        _client.close()
+        _client = None
+    _settings = settings or Settings.from_env(require=True)
+    _client = RedmineClient(_settings)
+    return _settings
 
 
-def format_response(obj):
-    """Format response as YAML or JSON based on REDMINE_RESPONSE_FORMAT env var."""
-    obj = redact(obj)
-    if REDMINE_RESPONSE_FORMAT == 'json':
-        return scrub_key(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
-    # YAML: Allow direct Unicode output, prevent line wrapping for long lines, and avoid automatic key sorting.
-    return scrub_key(yaml.safe_dump(obj, allow_unicode=True, sort_keys=False, width=4096))
+def get_settings() -> Settings:
+    global _settings
+    if _settings is None:
+        configure()
+    assert _settings is not None
+    return _settings
 
+
+def get_client() -> RedmineClient:
+    global _client
+    if _client is None:
+        configure()
+    assert _client is not None
+    return _client
 
 
 def wrap_insecure_content(content: str) -> str:
-    """Wrap content that may contain user-generated data with security tags to prevent prompt injection."""
     tag_id = uuid.uuid4().hex[:16]
     return f"<insecure-content-{tag_id}>\n{content}\n</insecure-content-{tag_id}>"
 
 
-def validate_path(file_path: str, must_exist: bool = True) -> tuple[str | None, pathlib.Path | None]:
-    """
-    Validate and resolve a file path.
-    Returns (None, resolved_path) on success, (error_message, None) on failure.
-    """
-    # Require allowed directories to be configured (secure by default)
-    if not REDMINE_ALLOWED_DIRECTORIES:
-        return "File operations disabled: REDMINE_ALLOWED_DIRECTORIES not configured", None
+def format_result(obj: Any) -> str:
+    settings = get_settings()
+    text = json.dumps(obj, ensure_ascii=False, indent=2, default=str)
+    return scrub_key(text, settings.api_key)
 
+
+def _tool_error(exc: Exception) -> str:
+    if isinstance(exc, ToolError):
+        return format_result(exc.to_dict())
+    settings = get_settings()
+    return format_result(
+        {
+            "error": {
+                "code": "REDMINE_UNAVAILABLE",
+                "message": scrub_key(f"{exc.__class__.__name__}: {exc}", settings.api_key),
+                "retryable": True,
+                "details": {},
+            }
+        }
+    )
+
+
+def _clamp_limit(value: int | None, default: int, maximum: int) -> int:
+    if value is None:
+        return default
+    return max(1, min(int(value), maximum))
+
+
+@mcp.tool(
+    description=(
+        "Read and analyze task requirements / acceptance criteria. "
+        "Call this FIRST when the user asks to read, summarize, or analyze an issue's "
+        "requirements or AC. Returns metadata, description (wrapped), and parsed AC groups."
+    )
+)
+def get_task_requirements(issue_id: int) -> str:
     try:
-        path = pathlib.Path(file_path).expanduser().resolve()
+        client = get_client()
+        settings = get_settings()
+        pack = build_requirements(client, int(issue_id), settings)
+        data = pack.model_dump()
+        if data.get("description"):
+            data["description"] = wrap_insecure_content(data["description"])
+        data["meta"]["approx_tokens"] = approx_tokens(data)
+        return format_result(data)
     except Exception as e:
-        return f"Invalid path: {file_path} ({e})", None
-
-    if not path.is_absolute():
-        return f"Path must be absolute, got: {file_path}", None
-
-    # Check path is within allowed directories
-    if not any(path.is_relative_to(allowed) for allowed in REDMINE_ALLOWED_DIRECTORIES):
-        return f"Path not in allowed directories: {file_path}", None
-
-    if must_exist and not path.exists():
-        return f"File not found: {path}", None
-
-    return None, path
+        return _tool_error(e)
 
 
-# Tools
-mcp = MCPServer("Redmine MCP server", version=VERSION)
-get_logger(__name__).info(f"Starting MCP Redmine version {VERSION}")
+@mcp.tool(
+    description=(
+        "Get a typed timeline of journal events for an issue (status/scope/assignment changes). "
+        "Use when analyzing how requirements or status changed over time, or to dig deeper after "
+        "get_completion_evidence / get_task_requirements."
+    )
+)
+def get_task_timeline(
+    issue_id: int,
+    limit: int | None = None,
+    cursor: str | None = None,
+    event_kinds: list[str] | None = None,
+    include_notes: bool = False,
+) -> str:
+    try:
+        client = get_client()
+        settings = get_settings()
+        lim = _clamp_limit(
+            limit, settings.timeline_default_limit, settings.timeline_max_limit
+        )
+        offset = decode_cursor(cursor)
+        started = client.call_count
+        issue = client.get_issue(int(issue_id), include="journals")
+        project = issue.get("project") or {}
+        if settings.allowed_project_ids:
+            pid = project.get("id") if isinstance(project, dict) else None
+            if pid not in settings.allowed_project_ids:
+                raise ToolError(
+                    "PROJECT_NOT_ALLOWED",
+                    f"Project {pid} is not in ALLOWED_PROJECT_IDS",
+                    details={"project_id": pid},
+                )
+        journals = issue.get("journals") or []
+        events, truncated, next_offset = map_journals(
+            [j for j in journals if isinstance(j, dict)],
+            event_kinds=event_kinds,
+            include_notes=include_notes,
+            limit=lim,
+            offset=offset,
+        )
+        # Wrap note previews
+        out_events = []
+        for ev in events:
+            d = ev.model_dump()
+            if d.get("note_preview"):
+                d["note_preview"] = wrap_insecure_content(d["note_preview"])
+            out_events.append(d)
+        result = TimelineResult(
+            issue_id=int(issue_id),
+            events=events,
+            next_cursor=encode_cursor(next_offset) if truncated else None,
+            truncated=truncated,
+            total_returned=len(events),
+            meta=Meta(
+                fetched_at=utc_now_iso(),
+                redmine_calls=client.call_count - started,
+            ),
+        )
+        data = result.model_dump()
+        data["events"] = out_events
+        data["meta"]["approx_tokens"] = approx_tokens(data)
+        return format_result(data)
+    except Exception as e:
+        return _tool_error(e)
 
-@mcp.tool(description="""
-Make a request to the Redmine API
 
-Args:
-    path: API endpoint path (e.g. '/issues.json')
-    method: HTTP method to use (default: 'get')
-    data: Dictionary for request body (for POST/PUT)
-    params: Dictionary for query parameters
+@mcp.tool(
+    description=(
+        "List child tasks of a parent issue (summaries only). "
+        "Use when analyzing scope breakdown or when completion evidence reports open children."
+    )
+)
+def list_child_tasks(
+    parent_issue_id: int,
+    limit: int | None = None,
+    cursor: str | None = None,
+    status_filter: str = "all",
+) -> str:
+    try:
+        client = get_client()
+        settings = get_settings()
+        lim = _clamp_limit(limit, settings.default_page_size, settings.max_page_size)
+        offset = decode_cursor(cursor)
+        status_map = {"all": "*", "open": "open", "closed": "closed"}
+        status_id = status_map.get((status_filter or "all").lower(), "*")
+        started = client.call_count
+        # Ensure parent exists / allowlist
+        parent = client.get_issue(int(parent_issue_id), include="children")
+        project = parent.get("project") or {}
+        if settings.allowed_project_ids:
+            pid = project.get("id") if isinstance(project, dict) else None
+            if pid not in settings.allowed_project_ids:
+                raise ToolError(
+                    "PROJECT_NOT_ALLOWED",
+                    f"Project {pid} is not in ALLOWED_PROJECT_IDS",
+                    details={"project_id": pid},
+                )
+        body = client.list_children(
+            int(parent_issue_id), status_id=status_id, limit=lim, offset=offset
+        )
+        issues = body.get("issues") or []
+        items = [map_child(i).model_dump() for i in issues if isinstance(i, dict)]
+        total_count = body.get("total_count")
+        truncated = False
+        next_cursor = None
+        if isinstance(total_count, int):
+            truncated = offset + len(items) < total_count
+        elif len(items) >= lim:
+            truncated = True
+        if truncated:
+            next_cursor = encode_cursor(offset + len(items))
+        data = {
+            "parent_issue_id": int(parent_issue_id),
+            "items": items,
+            "next_cursor": next_cursor,
+            "truncated": truncated,
+            "total_returned": len(items),
+            "meta": {
+                "source": "redmine",
+                "fetched_at": utc_now_iso(),
+                "redmine_calls": client.call_count - started,
+            },
+        }
+        data["meta"]["approx_tokens"] = approx_tokens(data)
+        return format_result(data)
+    except Exception as e:
+        return _tool_error(e)
 
-Returns:
-    str: YAML string containing response status code, body and error message
 
-{}""".format(REDMINE_REQUEST_INSTRUCTIONS).strip())
-    
-def redmine_request(path: str, method: str = 'get', data: dict = None, params: dict = None,
-                    ctx: Context = None) -> str:
-    return wrap_insecure_content(format_response(
-        request(path, method=method, data=data, params=params, ctx=ctx)))
+@mcp.tool(
+    description=(
+        "Recheck whether a Redmine task is complete. "
+        "Call this FIRST when the user asks if an issue is done / finished / ready to close. "
+        "Returns children_summary (open_ids), signals.completion_signal, "
+        "done_ratio_conflict (flag only), short timeline, parsed AC, next_actions. "
+        "Trust open_ids / status.is_closed over booleans. Does not close or modify the issue."
+    )
+)
+def get_completion_evidence(
+    issue_id: int,
+    include_acceptance_criteria: bool = True,
+    include_child_evidence: bool = True,
+    timeline_limit: int = 10,
+) -> str:
+    try:
+        client = get_client()
+        settings = get_settings()
+        pack = build_evidence(
+            client,
+            int(issue_id),
+            settings,
+            include_acceptance_criteria=include_acceptance_criteria,
+            include_child_evidence=include_child_evidence,
+            timeline_limit=timeline_limit,
+        )
+        data = pack.model_dump()
+        for ev in data.get("timeline") or []:
+            if ev.get("note_preview"):
+                ev["note_preview"] = wrap_insecure_content(ev["note_preview"])
+        data["meta"]["approx_tokens"] = approx_tokens(data)
+        return format_result(data)
+    except Exception as e:
+        return _tool_error(e)
 
-@mcp.tool()
+
+@mcp.tool(
+    description=(
+        "Read any Redmine REST endpoint with GET (read-only). "
+        "Use this for everything not covered by the domain helpers: other issue fields, "
+        "projects, users, time entries, versions, wiki, search, attachments metadata, ... "
+        "path is relative to REDMINE_URL, e.g. '/issues.json?status_id=*' or "
+        "'/issues/2774.json' with params={'include': 'journals,relations'}. "
+        "Returns {status_code, body, error}; body is JSON or text (redacted + wrapped)."
+    )
+)
+def redmine_get(path: str, params: dict[str, Any] | None = None) -> str:
+    try:
+        client = get_client()
+        result = client.get_raw(path, params=params)
+        body = result.get("body")
+        out: dict[str, Any] = {
+            "status_code": result.get("status_code", 0),
+            "path": path,
+            "body": body,
+            "error": result.get("error") or "",
+        }
+        if isinstance(body, (bytes, bytearray)):
+            out["body"] = f"<binary {len(body)} bytes>"
+        elif isinstance(body, str):
+            out["body"] = wrap_insecure_content(body)
+        return format_result(out)
+    except Exception as e:
+        return _tool_error(e)
+
+
+@mcp.tool(
+    description=(
+        "List available Redmine API paths from the bundled OpenAPI spec. "
+        "Use before redmine_get when you do not know the endpoint."
+    )
+)
 def redmine_paths_list() -> str:
-    """Return a list of available API paths from OpenAPI spec
-    
-    Retrieves all endpoint paths defined in the Redmine OpenAPI specification. Remember that you can use the
-    redmine_paths_info tool to get the full specfication for a path.
-    
-    Returns:
-        str: YAML string containing a list of path templates (e.g. '/issues.json')
-    """
-    return format_response(list(SPEC['paths'].keys()))
+    return format_result(list_paths())
 
-@mcp.tool()
-def redmine_paths_info(path_templates: list) -> str:
-    """Get full path information for given path templates
-    
-    Args:
-        path_templates: List of path templates (e.g. ['/issues.json', '/projects.json'])
-        
-    Returns:
-        str: YAML string containing API specifications for the requested paths
-    """
-    info = {}
-    for path in path_templates:
-        if path in SPEC['paths']:
-            info[path] = SPEC['paths'][path]
 
-    return format_response(info)
+@mcp.tool(
+    description=(
+        "Get full OpenAPI specs (methods, params, schemas) for given path templates, "
+        "e.g. ['/issues.json', '/time_entries.json']."
+    )
+)
+def redmine_paths_info(path_templates: list[str]) -> str:
+    return format_result(path_info(path_templates))
 
-@mcp.tool()
-def redmine_upload(file_path: str, description: str = None, ctx: Context = None) -> str:
-    """
-    Upload a file to Redmine and get a token for attachment
 
-    Args:
-        file_path: Fully qualified path to the file to upload (must be within REDMINE_ALLOWED_DIRECTORIES)
-        description: Optional description for the file
-
-    Returns:
-        str: YAML string containing response status code, body and error message
-             The body contains the attachment token
-    """
-    error, path = validate_path(file_path, must_exist=True)
-    if error:
-        return format_response({"status_code": 0, "body": None, "error": error})
-
-    try:
-        params = {'filename': path.name}
-        if description:
-            params['description'] = description
-
-        with open(path, 'rb') as f:
-            file_content = f.read()
-
-        result = request(path='uploads.json', method='post', params=params,
-                         content_type='application/octet-stream', content=file_content,
-                         ctx=ctx)
-        return format_response(result)
-    except Exception as e:
-        return format_response({"status_code": 0, "body": None, "error": f"{e.__class__.__name__}: {e}"})
-
-@mcp.tool()
-def redmine_download(attachment_id: int, save_path: str, filename: str | None = None,
-                     ctx: Context = None) -> str:
-    """
-    Download an attachment from Redmine and save it to a local file
-
-    Args:
-        attachment_id: The ID of the attachment to download
-        save_path: Fully qualified file path (not directory) where the file should be saved to (must be within REDMINE_ALLOWED_DIRECTORIES)
-        filename: Optional filename for the Redmine download URL. If not provided,
-                 will be determined from attachment metadata. Does not affect the local save path.
-
-    Returns:
-        str: YAML string containing download status, file path, and any error messages
-    """
-    error, path = validate_path(save_path, must_exist=False)
-    if error:
-        return format_response({"status_code": 0, "body": None, "error": error})
-
-    if path.is_dir():
-        return format_response({"status_code": 0, "body": None, "error": f"Path can't be a directory: {save_path}"})
-
-    try:
-        if not filename:
-            attachment_response = request(f"attachments/{attachment_id}.json", "get",
-                                          ctx=ctx)
-            if attachment_response["status_code"] != 200:
-                return format_response(attachment_response)
-
-            filename = attachment_response["body"]["attachment"]["filename"]
-
-        response = request(f"attachments/download/{attachment_id}/{filename}", "get",
-                           content_type="application/octet-stream", raw=True, ctx=ctx)
-        if response["status_code"] != 200 or not response["body"]:
-            return format_response(response)
-
-        # Create parent directories if needed
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        with open(path, 'wb') as f:
-            f.write(response["body"])
-
-        return format_response({"status_code": 200, "body": {"saved_to": str(path), "filename": filename}, "error": ""})
-    except Exception as e:
-        return format_response({"status_code": 0, "body": None, "error": f"{e.__class__.__name__}: {e}"})
-
-# Max size for images returned inline as tool content (base64 roughly x1.33, so keep this modest)
-ATTACHMENT_IMAGE_MAX_BYTES = 5 * 1024 * 1024
-
-@mcp.tool()
-def redmine_attachment_image(attachment_id: int, ctx: Context = None) -> Image | str:
-    """
-    Fetch an image attachment (e.g. an inline screenshot like !screenshot.png!) and return it as viewable
-    image content. Use redmine_request on '/issues/{id}.json' with params {'include': 'attachments'} to find
-    attachment ids.
-
-    Args:
-        attachment_id: The ID of the image attachment to fetch
-
-    Returns:
-        Image content on success, or a YAML error string on failure
-    """
-    try:
-        attachment_response = request(f"attachments/{attachment_id}.json", "get",
-                                      ctx=ctx)
-        if attachment_response["status_code"] != 200:
-            return format_response(attachment_response)
-
-        attachment = attachment_response["body"]["attachment"]
-        content_type = attachment.get("content_type") or ""
-        if not content_type.startswith("image/"):
-            return format_response({
-                "status_code": 0, "body": None,
-                "error": f"Attachment is not an image (content_type: {content_type}). "
-                         "Use redmine_download to save it to disk instead."})
-        if attachment.get("filesize", 0) > ATTACHMENT_IMAGE_MAX_BYTES:
-            return format_response({
-                "status_code": 0, "body": None,
-                "error": f"Image too large ({attachment['filesize']} bytes, max {ATTACHMENT_IMAGE_MAX_BYTES}). "
-                         "Use redmine_download to save it to disk instead."})
-
-        response = request(f"attachments/download/{attachment_id}/{attachment['filename']}", "get",
-                           content_type="application/octet-stream", raw=True, ctx=ctx)
-        if response["status_code"] != 200 or not response["body"]:
-            return format_response(response)
-
-        return Image(data=response["body"], format=content_type.removeprefix("image/"))
-    except Exception as e:
-        return format_response({"status_code": 0, "body": None, "error": f"{e.__class__.__name__}: {e}"})
-
-# Reject unknown tool arguments. The SDK's generated argument models default to ignoring
-# extras, so a model that writes body= instead of data= would send an empty request and
-# get a 204 back as if it worked (#52). Forbidding extras also makes the published schema
-# say additionalProperties: false, so validating clients reject the typo too.
-# The SDK has no option for this, hence the private attributes. mcp is pinned to an exact
-# version, so an SDK rename fails at import and gets caught by the tests before a release.
+# Reject unknown tool arguments (#52 behaviour)
 for _tool in mcp._tool_manager.list_tools():
     _tool.fn_metadata.arg_model.model_config["extra"] = "forbid"
     _tool.fn_metadata.arg_model.model_rebuild(force=True)
-    _tool.parameters["additionalProperties"] = False  # the schema is cached at registration
+    _tool.parameters["additionalProperties"] = False
 
 
-def main():
-    """Main entry point for the mcp-redmine package."""
+def run_check() -> int:
+    """Validate env + ping Redmine. Returns process exit code."""
+    load_dotenv()
+    try:
+        settings = Settings.from_env(require=True)
+    except ValueError as e:
+        print(f"FAIL: {e}")
+        return 1
+    client = RedmineClient(settings)
+    try:
+        body = client.check()
+        user = body.get("user") or {}
+        login = user.get("login") or user.get("firstname") or "ok"
+        print(f"OK: connected to {settings.redmine_url} as {login}")
+        return 0
+    except ToolError as e:
+        print(f"FAIL: [{e.code}] {e.message}")
+        return 1
+    except Exception as e:
+        print(f"FAIL: {e}")
+        return 1
+    finally:
+        client.close()
+
+
+def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser(description="MCP Redmine Server")
-    parser.add_argument("--transport", choices=["stdio", "streamable-http", "sse"], default="stdio",
-                        help="Transport type (default: stdio). streamable-http is the recommended HTTP "
-                             "transport, sse is supported for legacy clients.")
-    parser.add_argument("--host", default="0.0.0.0", help="Host for HTTP transports (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8000, help="Port for HTTP transports (default: 8000)")
+    import sys
+
+    parser = argparse.ArgumentParser(description="MCP Redmine domain server (stdio)")
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Validate REDMINE_URL/API_KEY and ping Redmine, then exit",
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio"],
+        default="stdio",
+        help="Transport (stdio only)",
+    )
+    parser.add_argument(
+        "--env-file",
+        default=None,
+        help="Optional path to .env (default: ./.env if present)",
+    )
     args = parser.parse_args()
 
-    if args.transport == "stdio":
-        mcp.run(transport="stdio")
-    else:
-        mcp.run(transport=args.transport, host=args.host, port=args.port)
+    load_dotenv(args.env_file)
+
+    if args.check:
+        sys.exit(run_check())
+
+    configure()
+    logger.info(f"Starting MCP Redmine domain server version {VERSION}")
+    mcp.run(transport="stdio")
+
 
 if __name__ == "__main__":
     main()

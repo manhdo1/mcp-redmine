@@ -1,13 +1,13 @@
 [project]
 name = "mcp-redmine"
-version = "2026.10.15.204909"
-description = "A MCP server that connects to your Redmine instance"
+version = "2026.10.31"
+description = "Domain MCP server for Redmine task requirements and completion recheck"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "httpx==0.28.1",
     "mcp[cli]==2.3.0",
-    "openapi-core==0.19.4",
+    "pydantic>=2.0",
     "pyyaml==6.0.2",
 ]
 authors = [
@@ -28,7 +28,6 @@ mcp-redmine = "mcp_redmine.server:main"
 [project.urls]
 Homepage = "https://github.com/runekaagaard/mcp-redmine"
 Issues = "https://github.com/runekaagaard/mcp-redmine/issues"
-Disussions = "https://github.com/runekaagaard/mcp-redmine/discussions"
 
 [build-system]
 requires = ["hatchling>=1.27"]
@@ -43,3 +42,6 @@ dev = [
     "build==1.2.2.post1",
     "hatchling==1.27.0",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

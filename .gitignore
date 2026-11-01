@@ -174,3 +174,5 @@ cython_debug/
 INSTRUCTIONS.md
 claude-artifacts/
 dev-artifacts/
+tests/
+.cursor/
