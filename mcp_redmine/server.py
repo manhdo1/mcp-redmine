@@ -284,7 +284,7 @@ def get_completion_evidence(
         "Use this for everything not covered by the domain helpers: other issue fields, "
         "projects, users, time entries, versions, wiki, search, attachments metadata, ... "
         "path is relative to REDMINE_URL, e.g. '/issues.json?status_id=*' or "
-        "'/issues/2774.json' with params={'include': 'journals,relations'}. "
+        "'/issues/123.json' with params={'include': 'journals,relations'}. "
         "Returns {status_code, body, error}; body is JSON or text (redacted + wrapped)."
     )
 )
