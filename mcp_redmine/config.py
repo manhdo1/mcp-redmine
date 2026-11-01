@@ -32,17 +32,6 @@ def _parse_headers(raw: str) -> dict[str, str]:
     return headers
 
 
-def _parse_id_list(raw: str) -> set[int]:
-    if not raw.strip():
-        return set()
-    out: set[int] = set()
-    for part in raw.split(","):
-        part = part.strip()
-        if part:
-            out.add(int(part))
-    return out
-
-
 def load_dotenv(path: str | Path | None = None) -> None:
     """Load KEY=VALUE pairs into os.environ if not already set."""
     env_path = Path(path) if path else Path.cwd() / ".env"
@@ -67,12 +56,12 @@ class Settings:
     headers: dict[str, str] = field(default_factory=dict)
     ca_bundle: str = ""
     dangerously_accept_invalid_certs: bool = False
-    allowed_project_ids: set[int] = field(default_factory=set)
     default_page_size: int = 20
     max_page_size: int = 50
     timeline_default_limit: int = 30
     timeline_max_limit: int = 100
     http_timeout_seconds: float = 30.0
+    http_max_response_bytes: int = 131072
     description_max_chars: int = 8000
 
     @property
@@ -113,13 +102,11 @@ class Settings:
                 "REDMINE_DANGEROUSLY_ACCEPT_INVALID_CERTS"
             )
             == "1",
-            allowed_project_ids=_parse_id_list(
-                os.environ.get("ALLOWED_PROJECT_IDS", "")
-            ),
             default_page_size=_env_int("DEFAULT_PAGE_SIZE", 20),
             max_page_size=_env_int("MAX_PAGE_SIZE", 50),
             timeline_default_limit=_env_int("TIMELINE_DEFAULT_LIMIT", 30),
             timeline_max_limit=_env_int("TIMELINE_MAX_LIMIT", 100),
             http_timeout_seconds=float(os.environ.get("HTTP_TIMEOUT_SECONDS", "30")),
+            http_max_response_bytes=_env_int("HTTP_MAX_RESPONSE_BYTES", 131072),
             description_max_chars=_env_int("DESCRIPTION_MAX_CHARS", 8000),
         )

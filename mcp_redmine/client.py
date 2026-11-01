@@ -2,12 +2,30 @@
 from __future__ import annotations
 
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
 from mcp_redmine.config import Settings
 from mcp_redmine.errors import ToolError
+
+_REDACT_KEYS = frozenset(
+    {
+        "api_key",
+        "apikey",
+        "x_redmine_api_key",
+        "password",
+        "passwd",
+        "passwd_confirmation",
+        "token",
+        "secret",
+        "access_token",
+        "private_key",
+    }
+)
+
+def _normalize_key(key: str) -> str:
+    return key.lower().replace("-", "_")
 
 
 def redact(obj: Any) -> Any:
@@ -16,7 +34,7 @@ def redact(obj: Any) -> Any:
         return {
             k: (
                 "[REDACTED]"
-                if k.lower().replace("-", "_") in ("api_key", "apikey")
+                if _normalize_key(str(k)) in _REDACT_KEYS
                 else redact(v)
             )
             for k, v in obj.items()
@@ -26,10 +44,42 @@ def redact(obj: Any) -> Any:
     return obj
 
 
-def scrub_key(text: str, api_key: str) -> str:
-    if api_key and isinstance(text, str):
-        return text.replace(api_key, "[REDACTED]")
+def scrub_key(
+    text: str,
+    api_key: str,
+    headers: dict[str, str] | None = None,
+) -> str:
+    """Scrub literal API key and optional header values from text."""
+    if not isinstance(text, str):
+        return text
+    if api_key:
+        text = text.replace(api_key, "[REDACTED]")
+    if headers:
+        for value in headers.values():
+            if value:
+                text = text.replace(value, "[REDACTED]")
     return text
+
+
+def _default_port(scheme: str) -> int | None:
+    if scheme == "https":
+        return 443
+    if scheme == "http":
+        return 80
+    return None
+
+
+def _origin_parts(url: str) -> tuple[str, str, int | None]:
+    parsed = urlparse(url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    port = parsed.port if parsed.port is not None else _default_port(scheme)
+    return scheme, host, port
+
+
+def same_origin(url: str, base_url: str) -> bool:
+    """True when url shares scheme, hostname, and port with base_url."""
+    return _origin_parts(url) == _origin_parts(base_url)
 
 
 class RedmineClient:
@@ -39,6 +89,7 @@ class RedmineClient:
         self._http = http_client or httpx.Client(
             timeout=settings.http_timeout_seconds,
             verify=settings.ssl_verify,
+            follow_redirects=False,
             limits=httpx.Limits(max_keepalive_connections=5, keepalive_expiry=120),
         )
         self.call_count = 0
@@ -52,6 +103,11 @@ class RedmineClient:
 
     def __exit__(self, *args: object) -> None:
         self.close()
+
+    def _scrub(self, text: str) -> str:
+        return scrub_key(
+            text, self.settings.api_key, headers=self.settings.headers
+        )
 
     def request(
         self,
@@ -84,7 +140,7 @@ class RedmineClient:
         }
 
         url = urljoin(self.settings.redmine_url, path.lstrip("/"))
-        if not url.startswith(self.settings.redmine_url):
+        if not same_origin(url, self.settings.redmine_url):
             return {
                 "status_code": 0,
                 "body": None,
@@ -100,18 +156,29 @@ class RedmineClient:
                 params=params,
                 headers=headers,
             )
+            content = response.content or b""
+            max_bytes = self.settings.http_max_response_bytes
+            if len(content) > max_bytes:
+                return {
+                    "status_code": 0,
+                    "body": None,
+                    "error": (
+                        f"RESPONSE_TOO_LARGE: response body "
+                        f"{len(content)} bytes exceeds limit {max_bytes}"
+                    ),
+                }
             response.raise_for_status()
             body: Any = None
-            if response.content:
+            if content:
                 try:
                     body = response.json()
                     if body is None:
                         raise ValueError("empty json body")
                 except ValueError:
                     try:
-                        body = response.content.decode("utf-8", errors="replace")
+                        body = content.decode("utf-8", errors="replace")
                     except Exception:
-                        body = response.content
+                        body = content
             return {"status_code": response.status_code, "body": body, "error": ""}
         except Exception as e:
             status_code = 0
@@ -120,6 +187,17 @@ class RedmineClient:
             if resp is not None:
                 status_code = getattr(resp, "status_code", 0) or 0
                 try:
+                    err_content = getattr(resp, "content", None) or b""
+                    max_bytes = self.settings.http_max_response_bytes
+                    if len(err_content) > max_bytes:
+                        return {
+                            "status_code": 0,
+                            "body": None,
+                            "error": (
+                                f"RESPONSE_TOO_LARGE: response body "
+                                f"{len(err_content)} bytes exceeds limit {max_bytes}"
+                            ),
+                        }
                     body = resp.json()
                 except Exception:
                     try:
@@ -129,7 +207,7 @@ class RedmineClient:
             return {
                 "status_code": status_code,
                 "body": body,
-                "error": scrub_key(f"{e.__class__.__name__}: {e}", key),
+                "error": self._scrub(f"{e.__class__.__name__}: {e}"),
             }
 
     def get_json(
@@ -139,6 +217,12 @@ class RedmineClient:
         if result["error"] and "escapes REDMINE_URL" in result["error"]:
             raise ToolError(
                 "INVALID_ARGUMENT",
+                result["error"],
+                details={"path": path},
+            )
+        if result["error"] and "RESPONSE_TOO_LARGE" in result["error"]:
+            raise ToolError(
+                "RESPONSE_TOO_LARGE",
                 result["error"],
                 details={"path": path},
             )
@@ -157,7 +241,7 @@ class RedmineClient:
             )
             raise ToolError(
                 code,
-                scrub_key(result["error"] or f"HTTP {status}", self.settings.api_key),
+                self._scrub(result["error"] or f"HTTP {status}"),
                 details={"status_code": status},
             )
         if status == 429:
@@ -170,19 +254,14 @@ class RedmineClient:
         if status == 0 or status >= 500:
             raise ToolError(
                 "REDMINE_UNAVAILABLE",
-                scrub_key(
-                    result["error"] or f"HTTP {status}", self.settings.api_key
-                ),
+                self._scrub(result["error"] or f"HTTP {status}"),
                 retryable=True,
                 details={"status_code": status},
             )
         if status != 200 or result["body"] is None:
             raise ToolError(
                 "REDMINE_UNAVAILABLE",
-                scrub_key(
-                    result["error"] or f"Unexpected HTTP {status}",
-                    self.settings.api_key,
-                ),
+                self._scrub(result["error"] or f"Unexpected HTTP {status}"),
                 retryable=status >= 500,
                 details={"status_code": status},
             )
@@ -203,12 +282,18 @@ class RedmineClient:
                 result["error"],
                 details={"path": path},
             )
+        if result["error"] and "RESPONSE_TOO_LARGE" in result["error"]:
+            raise ToolError(
+                "RESPONSE_TOO_LARGE",
+                result["error"],
+                details={"path": path},
+            )
         if result["error"] and "REDMINE_READ_ONLY" in result["error"]:
             raise ToolError("INVALID_ARGUMENT", result["error"])
         if result["error"] and result["status_code"] == 0:
             raise ToolError(
                 "REDMINE_UNAVAILABLE",
-                scrub_key(result["error"], self.settings.api_key),
+                self._scrub(result["error"]),
                 retryable=True,
                 details={"path": path},
             )

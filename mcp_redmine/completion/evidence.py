@@ -18,26 +18,11 @@ from mcp_redmine.models.completion import EvidencePack
 from mcp_redmine.models.issue import TaskRequirements
 
 
-def _ensure_project_allowed(settings: Settings, project_id: int | None) -> None:
-    if not settings.allowed_project_ids:
-        return
-    if project_id is None or project_id not in settings.allowed_project_ids:
-        raise ToolError(
-            "PROJECT_NOT_ALLOWED",
-            f"Project {project_id} is not in ALLOWED_PROJECT_IDS",
-            details={"project_id": project_id},
-        )
-
-
 def build_requirements(
     client: RedmineClient, issue_id: int, settings: Settings
 ) -> TaskRequirements:
     started = client.call_count
     issue = client.get_issue(issue_id, include="children")
-    project = issue.get("project") or {}
-    _ensure_project_allowed(
-        settings, project.get("id") if isinstance(project, dict) else None
-    )
 
     task = map_snapshot(issue)
     description = issue.get("description")
@@ -90,10 +75,6 @@ def build_evidence(
         journals_issue = client.get_issue(issue_id, include="journals")
         issue["journals"] = journals_issue.get("journals") or []
 
-    project = issue.get("project") or {}
-    _ensure_project_allowed(
-        settings, project.get("id") if isinstance(project, dict) else None
-    )
     task = map_snapshot(issue)
 
     children = []

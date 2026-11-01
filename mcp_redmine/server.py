@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from typing import Any
 
@@ -80,7 +81,7 @@ def wrap_insecure_content(content: str) -> str:
 def format_result(obj: Any) -> str:
     settings = get_settings()
     text = json.dumps(obj, ensure_ascii=False, indent=2, default=str)
-    return scrub_key(text, settings.api_key)
+    return scrub_key(text, settings.api_key, headers=settings.headers)
 
 
 def _tool_error(exc: Exception) -> str:
@@ -91,7 +92,11 @@ def _tool_error(exc: Exception) -> str:
         {
             "error": {
                 "code": "REDMINE_UNAVAILABLE",
-                "message": scrub_key(f"{exc.__class__.__name__}: {exc}", settings.api_key),
+                "message": scrub_key(
+                    f"{exc.__class__.__name__}: {exc}",
+                    settings.api_key,
+                    headers=settings.headers,
+                ),
                 "retryable": True,
                 "details": {},
             }
@@ -149,15 +154,6 @@ def get_task_timeline(
         offset = decode_cursor(cursor)
         started = client.call_count
         issue = client.get_issue(int(issue_id), include="journals")
-        project = issue.get("project") or {}
-        if settings.allowed_project_ids:
-            pid = project.get("id") if isinstance(project, dict) else None
-            if pid not in settings.allowed_project_ids:
-                raise ToolError(
-                    "PROJECT_NOT_ALLOWED",
-                    f"Project {pid} is not in ALLOWED_PROJECT_IDS",
-                    details={"project_id": pid},
-                )
         journals = issue.get("journals") or []
         events, truncated, next_offset = map_journals(
             [j for j in journals if isinstance(j, dict)],
@@ -212,17 +208,8 @@ def list_child_tasks(
         status_map = {"all": "*", "open": "open", "closed": "closed"}
         status_id = status_map.get((status_filter or "all").lower(), "*")
         started = client.call_count
-        # Ensure parent exists / allowlist
-        parent = client.get_issue(int(parent_issue_id), include="children")
-        project = parent.get("project") or {}
-        if settings.allowed_project_ids:
-            pid = project.get("id") if isinstance(project, dict) else None
-            if pid not in settings.allowed_project_ids:
-                raise ToolError(
-                    "PROJECT_NOT_ALLOWED",
-                    f"Project {pid} is not in ALLOWED_PROJECT_IDS",
-                    details={"project_id": pid},
-                )
+        # Ensure parent exists
+        client.get_issue(int(parent_issue_id), include="children")
         body = client.list_children(
             int(parent_issue_id), status_id=status_id, limit=lim, offset=offset
         )
@@ -354,7 +341,8 @@ def run_check() -> int:
     try:
         settings = Settings.from_env(require=True)
     except ValueError as e:
-        print(f"FAIL: {e}")
+        key = (os.environ.get("REDMINE_API_KEY") or "").strip()
+        print(scrub_key(f"FAIL: {e}", key))
         return 1
     client = RedmineClient(settings)
     try:
@@ -364,10 +352,22 @@ def run_check() -> int:
         print(f"OK: connected to {settings.redmine_url} as {login}")
         return 0
     except ToolError as e:
-        print(f"FAIL: [{e.code}] {e.message}")
+        print(
+            scrub_key(
+                f"FAIL: [{e.code}] {e.message}",
+                settings.api_key,
+                headers=settings.headers,
+            )
+        )
         return 1
     except Exception as e:
-        print(f"FAIL: {e}")
+        print(
+            scrub_key(
+                f"FAIL: {e}",
+                settings.api_key,
+                headers=settings.headers,
+            )
+        )
         return 1
     finally:
         client.close()
